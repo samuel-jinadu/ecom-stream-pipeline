@@ -306,6 +306,13 @@ This project is a compact example of the **streaming lakehouse pattern**:
 
 It shows how to move from “report yesterday’s numbers tomorrow” to “see what’s happening now.”
 
+
+---
+
+**Note**: Codespaces has a container to container networking issue, if you are trying to run this in codespaces and it fails with mysterious errors, run this
+```bash
+sudo iptables-legacy -P FORWARD ACCEPT && sudo iptables-legacy -I FORWARD 1 -i br-+ -j ACCEPT && sudo iptables-legacy -I FORWARD 1 -o br-+ -j ACCEPT || true
+```
 ---
 
 ## License

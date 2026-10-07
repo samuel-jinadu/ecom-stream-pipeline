@@ -7,7 +7,8 @@ import pandas as pd
 from dotenv import load_dotenv
 from kafka.admin import KafkaAdminClient
 from kafka.errors import TopicAlreadyExistsError
-
+from tenacity import retry, stop_after_attempt, wait_exponential
+from kafka.errors import KafkaTimeoutError
 from kafka import DefaultSerializer, JsonSerializer, KafkaProducer
 
 load_dotenv()
@@ -16,6 +17,11 @@ if KAFKA_BOOTSTRAP is None:
     raise RuntimeError("KAFKA_BOOTSTRAP environment var is missing!")
 
 
+@retry(
+    stop=stop_after_attempt(10),
+    wait=wait_exponential(multiplier=1, min=1, max=10),
+    retry=lambda exc: isinstance(exc, KafkaTimeoutError),
+)
 def ensure_topics(topics: dict):
     admin = KafkaAdminClient(bootstrap_servers=KAFKA_BOOTSTRAP)
     for name, config in topics.items():

@@ -5,7 +5,7 @@ from dotenv import load_dotenv
 from psycopg import sql
 from psycopg.rows import dict_row
 from psycopg_pool import ConnectionPool
-from tenacity import retry, stop_after_attempt
+from tenacity import retry, stop_after_attempt, wait_exponential
 
 load_dotenv()
 
@@ -34,7 +34,7 @@ def get_schema_sql():
     with open(path, "r") as f:
         return f.read()
 
-
+@retry(stop=stop_after_attempt(10), wait=wait_exponential(min=1, max=5))
 def make_tables():
     with pool.connection() as conn, conn.cursor() as cur:
         cur.execute(get_schema_sql())
@@ -53,7 +53,7 @@ def write_data_to_postgres(row: dict, table: str):
         cur.execute(query, list(row.values()))
         conn.commit()
 
-
+@retry(stop=stop_after_attempt(10), wait=wait_exponential(min=1, max=5))
 def get_data_from_postgres(table):
     with pool.connection() as conn, conn.cursor() as cur:
         return cur.execute(

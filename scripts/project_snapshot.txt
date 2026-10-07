@@ -1,149 +1,332 @@
 [DIR]  .
---- ./.gitignore ---
-kafka/server.properties
-kafka/cluster.id
-kafka/data/
-kafka/kafka.pid
-kafka/kafka.log
-__pycache__/
-.venv/--- ./compose.yaml ---
-services:
-  postgres:
-    image: postgres:16
-    environment:
-      POSTGRES_DB: ecommerce
-      POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: postgres
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres -d ecommerce"]
-      interval: 5s
-      retries: 5
-    ports: ["5432:5432"]
-    volumes:
-      - pgdata:/var/lib/postgresql/data
-      - ./data/schema.sql:/docker-entrypoint-initdb.d/schema.sql
+--- ./README.md ---
+# Ecom Pipeline: Real-Time E-commerce Analytics with Kafka & Postgres
 
-  kafka:
-    image: apache/kafka
-    ports:
-      - "29092:29092"
-    environment:
-      KAFKA_NODE_ID: 1
-      KAFKA_PROCESS_ROLES: broker,controller
-      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093,PLAINTEXT_HOST://:29092
-      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:29092
-      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
-      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
-      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
-      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
-      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
-      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
-      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
-      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
-    healthcheck:
-      test: ["CMD", "bash", "-c", "kafka-topics.sh --bootstrap-server localhost:9092 --list"]
-      interval: 5s
-      retries: 10
+A streaming data pipeline that ingests e-commerce orders, products, and inventory events, enriches them in near real-time, detects low-stock situations, and surfaces live business metrics through a Streamlit dashboard.
 
-  app-producer:
-    build:
-      context: .
-      dockerfile: Dockerfile.app
-    depends_on:
-      kafka:
-        condition: service_healthy
-    environment:
-      KAFKA_BOOTSTRAP: kafka:9092
-      POSTGRES_DSN: postgresql://postgres:postgres@postgres:5432/ecommerce
-      CREATE_TABLE_SQL_PATH: ./data/schema.sql
-    # Generate CSVs first, then stream them
-    command: ["sh", "-c", "uv run ecom-pipeline && uv run producer"]
+---
 
-  app-aggregator:
-    build:
-      context: .
-      dockerfile: Dockerfile.app
-    depends_on:
-      kafka:
-        condition: service_healthy
-      postgres:
-        condition: service_healthy
-    environment:
-      KAFKA_BOOTSTRAP: kafka:9092
-      POSTGRES_DSN: postgresql://postgres:postgres@postgres:5432/ecommerce
-      CREATE_TABLE_SQL_PATH: ./data/schema.sql
-    command: ["uv", "run", "aggregator"]
+## Overview
 
-  dashboard:
-    build:
-      context: .
-      dockerfile: Dockerfile.app
-    depends_on:
-      postgres:
-        condition: service_healthy
-    environment:
-      POSTGRES_DSN: postgresql://postgres:postgres@postgres:5432/ecommerce
-      CREATE_TABLE_SQL_PATH: ./data/schema.sql
-      # Important for Docker: bind to all interfaces and disable headless browser
-      STREAMLIT_SERVER_ADDRESS: 0.0.0.0
-      STREAMLIT_SERVER_PORT: 8501
-      STREAMLIT_SERVER_HEADLESS: "true"
-    ports:
-      - "8501:8501"
-    command: ["uv", "run", "dashboard"]
+This project simulates an e-commerce platform’s event stream and demonstrates an end-to-end data engineering workflow:
 
-volumes:
-  pgdata:--- ./pyproject.toml ---
-[project]
-name = "ecom-pipeline"
-version = "0.1.0"
-requires-python = ">=3.12"
-dependencies = [
-    "Faker>=40.40.0",
-    "pandas>=3.0.6",
-    "faker-ecommerce-provider>=1.2.0",
-    "kafka-python>=3.0.11",
-    "psycopg[binary]>=3.3.6",
-    "streamlit>=1.65.0",
-    "python-dotenv>=1.2.4",
-    "psycopg-pool>=3.3.3",
-    "tenacity>=9.2.1",
-    "streamlit-autorefresh>=1.0.1"
-]
+- **Generate** synthetic products, inventory, and orders as CSV files.
+- **Produce** them as JSON events into Kafka topics.
+- **Consume** and process those streams with Python workers.
+- **Enrich** orders with product prices to compute revenue.
+- **Alert** on low inventory.
+- **Store** results in PostgreSQL.
+- **Visualize** top products, low stock, and alerts on a live dashboard.
 
-[dependency-groups]
-dev = [
-    "black>=26.10.0",
-    "ruff>=0.16.10",
-]
+It runs either fully in Docker Compose or locally with `uv`, Kafka, and Postgres.
 
+---
 
-[build-system]
-requires = ["hatchling"]
-build-backend = "hatchling.build"
+## The Data Engineering Problem
 
-[tool.hatch.build.targets.wheel]
-packages = ["ecom_pipeline"]
+Traditional batch reporting answers questions like *“What were yesterday’s top products?”* only after a full ETL cycle. That creates several problems:
 
-[project.scripts]
-ecom-pipeline = "ecom_pipeline.__main__:main"
-producer = "ecom_pipeline.producer:run_all_producers"
-aggregator = "ecom_pipeline.aggregator:consume_all_streams"
-alerts = "ecom_pipeline.aggregator:produce_alert_stream_cli"
-dashboard = "ecom_pipeline.dashboard:main"
---- ./.dockerignore ---
-kafka/kafka_2.13-*/
-kafka/data/
-kafka/kafka.pid
-kafka/kafka.log
-kafka/cluster.id
-kafka/server.properties--- ./.env ---
+- **Stale dashboards** – business users see data that is hours or days old.
+- **Delayed alerts** – low-stock situations are discovered too late.
+- **Tight coupling** – reporting logic reads directly from source tables, making it hard to add new consumers.
+- **Reprocessing overhead** – every new metric often requires rerunning the entire batch job.
+
+In short: the business needs **fresh, continuously updated metrics and alerts**, not a nightly snapshot.
+
+---
+
+## How It Solves It
+
+The pipeline replaces the batch-only mindset with a **streaming, event-driven architecture**:
+
+1. **Decoupled ingestion** – Orders, products, and inventory are published as independent Kafka topics. Producers and consumers scale and evolve separately.
+2. **Stream–table join for enrichment** – The aggregator first consumes the `products` topic into an in-memory lookup table, then joins each `orders` event with its product price to compute `revenue` in real time.
+3. **Continuous alerting** – The inventory consumer evaluates every stock update and emits a `LOW_STOCK` alert to both Kafka and Postgres when stock drops below 5.
+4. **Materialized views for fast reads** – PostgreSQL views (`top_ten_products`, `low_stock_products`) pre-define business metrics so the dashboard queries stay simple and fast.
+5. **Idempotent, at-least-once processing** – Producers use idempotent writes with `acks=all`; consumers commit offsets manually after writing; inserts use `ON CONFLICT DO NOTHING`. This makes replays safe and prevents duplicates.
+6. **Live dashboard** – Streamlit auto-refreshes every 2 seconds, reading directly from Postgres views, so the UI always reflects the latest committed state.
+
+The result is a pipeline where yesterday’s revenue, current low-stock items, and recent alerts are available **while events are still flowing**.
+
+---
+
+## Architecture
+
+```
+┌─────────────────┐     ┌─────────────────┐     ┌─────────────────┐
+│  CSV Generator  │────▶│    Producer     │────▶│     Kafka       │
+│ (Faker + Pandas)│     │ (3 topics)      │     │ orders/products │
+└─────────────────┘     └─────────────────┘     │ /inventory      │
+                                                 └────────┬────────┘
+                                                          │
+                     ┌────────────────────────────────────┼────────────────────────────────────┐
+                     │                                    │                                    │
+                     ▼                                    ▼                                    ▼
+          ┌─────────────────────┐            ┌─────────────────────┐            ┌─────────────────────┐
+          │  Orders Consumer    │            │  Join Orders +      │            │  Inventory Alert    │
+          │  (write raw orders) │            │  Products Consumer  │            │  Processor          │
+          └─────────────────────┘            │  (enrich revenue)   │            │  (stock < 5)        │
+                                             └──────────┬──────────┘            └──────────┬──────────┘
+                                                        │                                  │
+                                                        ▼                                  ▼
+                                             ┌─────────────────────────────────────────────────────┐
+                                             │                  PostgreSQL                         │
+                                             │  orders, orders_enriched, inventory, alerts,        │
+                                             │  products, top_ten_products, low_stock_products     │
+                                             └──────────────────────────┬──────────────────────────┘
+                                                                        │
+                                                                        ▼
+                                                             ┌─────────────────────┐
+                                                             │  Streamlit Dashboard│
+                                                             │  (auto-refresh 2s)  │
+                                                             └─────────────────────┘
+```
+
+---
+
+## Data Flow
+
+1. `ecom-pipeline` generates `products.csv`, `inventory.csv`, and `orders.csv` under `data/generated/`.
+2. `producer` reads those CSVs and publishes records to Kafka topics:
+   - `orders` (keyed by `order_id`)
+   - `products` (keyed by `id`, compacted topic)
+   - `inventory` (keyed by `product_id`)
+3. `aggregator` runs multiple consumers in parallel:
+   - Writes raw `orders`, `products`, `inventory` rows to Postgres.
+   - Builds an in-memory product lookup from the `products` topic, then enriches each `orders` event with `revenue = price × quantity` and writes to `orders_enriched`.
+   - Watches `inventory` for stock < 5 and produces `alerts` to Kafka and Postgres.
+4. The dashboard reads `top_ten_products`, `low_stock_products`, and `alerts` views every 2 seconds.
+
+---
+
+## Components
+
+| Component | Entry point | Description |
+|-----------|-------------|-------------|
+| **Generator** | `uv run ecom-pipeline` | Creates synthetic CSVs and a batch report. |
+| **Producer** | `uv run producer` | Publishes CSV rows to Kafka topics. |
+| **Aggregator** | `uv run aggregator` | Consumes streams, enriches orders, writes to Postgres, emits alerts. |
+| **Alerts CLI** | `uv run alerts` | Runs only the alert-producing consumer. |
+| **Dashboard** | `uv run dashboard` | Launches Streamlit UI. |
+| **Batch report** | `ecom_pipeline.batch_report` | Computes top-ten products from CSVs and saves CSV/SQLite. |
+
+---
+
+## Data Model
+
+Defined in `data/schema.sql`:
+
+- `orders` – raw order events.
+- `orders_enriched` – orders joined with product price and computed revenue.
+- `inventory` – current stock per product.
+- `products` – product catalog.
+- `alerts` – low-stock alert records.
+- `top_ten_products` (view) – top 10 products by revenue for yesterday.
+- `low_stock_products` (view) – products with stock < 10.
+
+---
+
+## Getting Started
+
+### Prerequisites
+
+- [Docker](https://docs.docker.com/get-docker/) and Docker Compose **or**
+- Python 3.12+, [`uv`](https://docs.astral.sh/uv/), a local Kafka installation, and PostgreSQL 16.
+
+### Option 1: Docker Compose (recommended)
+
+```bash
+docker compose up --build
+```
+
+Then open the dashboard at [http://localhost:8501](http://localhost:8501).
+
+This starts:
+- PostgreSQL 16 with the schema auto-loaded.
+- Apache Kafka (KRaft mode, no ZooKeeper).
+- `app-producer` – generates CSVs and streams them.
+- `app-aggregator` – consumes streams and writes to Postgres.
+- `dashboard` – Streamlit UI.
+
+To stop and remove volumes:
+
+```bash
+docker compose down -v
+```
+
+### Option 2: Local Development
+
+1. **Install dependencies**
+
+   ```bash
+   uv sync
+   ```
+
+2. **Set up environment variables**
+
+   Create `.env` in the project root:
+
+   ```env
+   KAFKA_BOOTSTRAP=localhost:9092
+   POSTGRES_DSN=postgresql://kafka_user:1234@localhost:5432/ecommerce
+   CREATE_TABLE_SQL_PATH=./data/schema.sql
+   ```
+
+   Adjust the DSN to match your local Postgres user/password.
+
+3. **Set up PostgreSQL**
+
+   Create the database `ecommerce` and apply `data/schema.sql`:
+
+   ```bash
+   psql -U kafka_user -h localhost -d ecommerce -f data/schema.sql
+   ```
+
+4. **Install and start Kafka**
+
+   ```bash
+   bash scripts/install-kafka.sh
+   bash scripts/run-kafka.sh
+   ```
+
+   The script formats storage, starts the broker, and tails logs. Use `bash scripts/stop-kafka.sh` to stop it.
+
+5. **Generate data and run the batch report**
+
+   ```bash
+   uv run ecom-pipeline
+   ```
+
+6. **Start the producer** (in one terminal)
+
+   ```bash
+   uv run producer
+   ```
+
+7. **Start the aggregator** (in another terminal)
+
+   ```bash
+   uv run aggregator
+   ```
+
+8. **Start the dashboard** (in a third terminal)
+
+   ```bash
+   uv run dashboard
+   ```
+
+   Visit [http://localhost:8501](http://localhost:8501).
+
+---
+
+## Configuration
+
+| Variable | Description | Example |
+|----------|-------------|---------|
+| `KAFKA_BOOTSTRAP` | Kafka bootstrap server(s). | `localhost:9092` or `kafka:9092` |
+| `POSTGRES_DSN` | PostgreSQL connection string. | `postgresql://postgres:postgres@localhost:5432/ecommerce` |
+| `CREATE_TABLE_SQL_PATH` | Path to the schema SQL file. | `./data/schema.sql` |
+
+For Docker Compose, these are set automatically in `compose.yaml`. For local runs, use `.env`.
+
+---
+
+## Usage
+
+- **Reset Kafka state** (local only):
+
+  ```bash
+  bash scripts/reset-kafka.sh
+  ```
+
+- **Check Kafka processes**:
+
+  ```bash
+  bash scripts/check-kafka.sh
+  ```
+
+- **Check Postgres row counts**:
+
+  ```bash
+  bash scripts/check-postgres.sh
+  ```
+
+- **Run only the alert stream**:
+
+  ```bash
+  uv run alerts
+  ```
+
+---
+
+## Project Structure
+
+```
+.
+├── compose.yaml                 # Docker Compose stack
+├── Dockerfile.app               # App image (Python + uv)
+├── Dockerfile.deprecated        # Old local Kafka image
+├── pyproject.toml               # Dependencies and entry points
+├── .env                         # Local environment variables
+├── data/
+│   ├── schema.sql               # Postgres schema + views
+│   ├── generated/               # Generated CSVs
+│   └── processed/               # Batch report output
+├── ecom_pipeline/
+│   ├── __main__.py              # `ecom-pipeline` entry point
+│   ├── generate.py              # Faker-based CSV generation
+│   ├── producer.py              # Kafka producers
+│   ├── aggregator.py            # Kafka consumers + Postgres writes
+│   ├── postgres.py              # Connection pool + helpers
+│   ├── dashboard.py             # Streamlit UI
+│   ├── batch_report.py          # Batch top-ten report
+│   └── stream_report.py         # Placeholder
+├── scripts/
+│   ├── install-kafka.sh         # Download and extract Kafka
+│   ├── run-kafka.sh             # Start Kafka locally
+│   ├── stop-kafka.sh            # Stop Kafka
+│   ├── reset-kafka.sh           # Remove Kafka data
+│   ├── check-kafka.sh           # List Kafka processes
+│   ├── check-postgres.sh        # Row counts
+│   └── kafka-common.sh          # Shared shell helpers
+└── kafka/
+    ├── server.properties.template
+    └── server.properties        # Rendered config
+```
+
+---
+
+## Why This Matters
+
+This project is a compact example of the **streaming lakehouse pattern**:
+
+- Events are first-class citizens.
+- Consumers are independent and replayable.
+- Enrichment happens in-flight, not in a nightly batch.
+- Storage and serving layers are separated.
+- The dashboard is a thin read layer over materialized views.
+
+It shows how to move from “report yesterday’s numbers tomorrow” to “see what’s happening now.”
+
+---
+
+## License
+
+MIT License. See [LICENSE](./LICENSE) for details.--- ./.env ---
 KAFKA_BOOTSTRAP=localhost:9092
 
 POSTGRES_DSN=postgresql://kafka_user:1234@localhost:5432/ecommerce
-CREATE_TABLE_SQL_PATH=./data/schema.sql--- ./Dockerfile.app ---
+CREATE_TABLE_SQL_PATH=./data/schema.sql--- ./Dockerfile.deprecated ---
 # Start from the minimal official Python slim image
 FROM python:3.11-slim
+
+
+# Install Java (OpenJDK) headless and clean up package caches in one layer
+RUN apt-get update && apt-get install -y \
+    openjdk-17-jre-headless \
+    curl \
+    procps \
+    && rm -rf /var/lib/apt/lists/*
 
 # get uv
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
@@ -155,14 +338,28 @@ WORKDIR /app
 # Copy dependency configuration files first to leverage Docker layer caching
 COPY pyproject.toml uv.lock ./
 COPY ecom_pipeline ./ecom_pipeline
-COPY data ./data
 
 # Run uv sync to install dependencies without the project source code yet
-RUN uv sync --frozen --no-dev
+RUN uv sync --frozen --no-install-project --no-dev
+
+# Copy the project
+COPY scripts ./scripts
+COPY kafka ./kafka
+COPY data ./data
+
+
+ENV KAFKA_VERSION=4.3.1
+ENV KAFKA_HOME=/app/kafka/kafka_2.13-4.3.1
+ENV PATH=${KAFKA_HOME}/bin:${PATH}
+
+
+# install kafka
+RUN chmod +x scripts/*.sh
+RUN bash scripts/install-kafka.sh
 
 
 
-CMD ["uv", "run"][DIR]  ./data
+CMD ["bash", "scripts/run-kafka-docker.sh"][DIR]  ./data
 --- ./data/schema.sql ---
 DROP SCHEMA public CASCADE;
 CREATE SCHEMA public;
@@ -222,185 +419,440 @@ FROM inventory INNER JOIN products
 ON inventory.product_id = products.id
 WHERE  inventory.stock < 10 ORDER BY  inventory.stock ASC;[DIR]  ./data/generated
 [DIR]  ./data/processed
-[DIR]  ./scripts
---- ./scripts/kafka-common.sh ---
-#!/bin/bash
-# Shared helpers for Kafka scripts. Source this, don't execute it.
+--- ./.gitignore ---
+kafka/server.properties
+kafka/cluster.id
+kafka/data/
+kafka/kafka.pid
+kafka/kafka.log
+__pycache__/
+.venv/
+.ruff_cache
+.vscode--- ./pyproject.toml ---
+[project]
+name = "ecom-pipeline"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = [
+    "Faker>=40.40.0",
+    "pandas>=3.0.6",
+    "faker-ecommerce-provider>=1.2.0",
+    "kafka-python>=3.0.11",
+    "psycopg[binary]>=3.3.6",
+    "streamlit>=1.65.0",
+    "python-dotenv>=1.2.4",
+    "psycopg-pool>=3.3.3",
+    "tenacity>=9.2.1",
+    "streamlit-autorefresh>=1.0.1"
+]
 
-find_project_root() {
-    local dir="$1"
-    while [ "$dir" != "/" ]; do
-        if [ -f "$dir/pyproject.toml" ]; then
-            echo "$dir"
-            return 0
-        fi
-        dir="$(dirname "$dir")"
-    done
-    echo "ERROR: could not find project root (no pyproject.toml)" >&2
-    return 1
-}
-
-# Sets: PROJECT_ROOT, SCRIPT_DIR, KAFKA_DIR, KAFKA_CONFIG, KAFKA_DATA_DIR
-setup_paths() {
-    SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-    PROJECT_ROOT="$(find_project_root "$SCRIPT_DIR")"
-    KAFKA_DIR="$PROJECT_ROOT/kafka"
-    KAFKA_CONFIG="$KAFKA_DIR/server.properties"
-    KAFKA_TEMPLATE="$KAFKA_DIR/server.properties.template"
-    KAFKA_DATA_DIR="$KAFKA_DIR/data"
-    export PROJECT_ROOT SCRIPT_DIR KAFKA_DIR KAFKA_CONFIG KAFKA_TEMPLATE KAFKA_DATA_DIR
-
-}
-
-render_config() {
-    mkdir -p "$KAFKA_DATA_DIR"
-    sed "s|__KAFKA_DATA_DIR__|$KAFKA_DATA_DIR|g" \
-        "$KAFKA_TEMPLATE" > "$KAFKA_CONFIG"
-}--- ./scripts/run-kafka.sh ---
-#!/bin/bash
-set -euo pipefail
-source "$(dirname "${BASH_SOURCE[0]}")/kafka-common.sh"
-setup_paths
-
-render_config
+[dependency-groups]
+dev = [
+    "black>=26.10.0",
+    "ruff>=0.16.10",
+]
 
 
-CLUSTER_ID="$(cat "$KAFKA_DIR/cluster.id" 2>/dev/null || kafka-storage.sh random-uuid)"
-echo "$CLUSTER_ID" > "$KAFKA_DIR/cluster.id"
-kafka-storage.sh format -t "$CLUSTER_ID" -c "$KAFKA_CONFIG" --ignore-formatted
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
 
-PID_FILE="$KAFKA_DIR/kafka.pid"
+[tool.hatch.build.targets.wheel]
+packages = ["ecom_pipeline"]
 
-if [ -f "$PID_FILE" ] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
-    echo "Kafka already running (PID $(cat "$PID_FILE"))."
-    exit 0
-fi
+[project.scripts]
+ecom-pipeline = "ecom_pipeline.__main__:main"
+producer = "ecom_pipeline.producer:run_all_producers"
+aggregator = "ecom_pipeline.aggregator:consume_all_streams"
+alerts = "ecom_pipeline.aggregator:produce_alert_stream_cli"
+dashboard = "ecom_pipeline.dashboard:main"
+--- ./Dockerfile.app ---
+# Start from the minimal official Python slim image
+FROM python:3.12-slim
 
-LOG_FILE="$KAFKA_DIR/kafka.log"
-echo "Starting Kafka..."
-# export KAFKA_LOG4J_OPTS="-Dlog4j2.configurationFile=file:/path/to/your/custom-log4j2.yaml" # this line is in case i change my mind about a custom log options file
-kafka-server-start.sh "$KAFKA_CONFIG" > "$LOG_FILE" 2>&1 &
+# get uv
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
 
-PID=$!
-echo "$PID" > "$PID_FILE"
+# Set up your working directory
+WORKDIR /app
 
-# Wait a moment and verify it's actually alive
-sleep 2
-if ! kill -0 "$PID" 2>/dev/null; then
-    echo "ERROR: Kafka died during startup. Last 20 lines of $LOG_FILE:" >&2
-    tail -n 20 "$LOG_FILE" >&2
-    rm -f "$PID_FILE"
-    exit 1
-fi
 
-echo "Kafka started (PID $PID). Logs: $LOG_FILE"
+# Copy dependency configuration files first to leverage Docker layer caching
+COPY pyproject.toml uv.lock ./
+COPY ecom_pipeline ./ecom_pipeline
+COPY data ./data
 
-# kafka-topics.sh --create \
-#   --topic orders \
-#   --partitions 1 \
-#   --replication-factor 1 \
-#   --bootstrap-server localhost:9092 \
-#   --if-not-exists
+# Run uv sync to install dependencies without the project source code yet
+RUN uv sync --frozen --no-dev
 
-tail -f "$LOG_FILE"--- ./scripts/install-kafka.sh ---
-#!/bin/bash
-set -euo pipefail
-source "$(dirname "${BASH_SOURCE[0]}")/kafka-common.sh"
-setup_paths
 
-: "${KAFKA_VERSION:=4.3.1}"
-: "${SCALA_VERSION:=2.13}"
-: "${ARCHIVE_NAME:=kafka_${SCALA_VERSION}-${KAFKA_VERSION}}"
-TARBALL="${ARCHIVE_NAME}.tgz"
-DOWNLOAD_URL="https://archive.apache.org/kafka/${KAFKA_VERSION}/${TARBALL}"
-INSTALL_DIR="$KAFKA_DIR/${ARCHIVE_NAME}"
 
-mkdir -p "$KAFKA_DIR"
-cd "$KAFKA_DIR"
+CMD ["uv", "run"][DIR]  ./kafka
+--- ./kafka/server.properties.template ---
+process.roles=broker,controller
+node.id=1
+controller.quorum.voters=1@localhost:9093
+log.dirs=__KAFKA_DATA_DIR__
+listeners=PLAINTEXT://:9092,CONTROLLER://:9093
+controller.listener.names=CONTROLLER
+listener.security.protocol.map=CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+offsets.topic.replication.factor=1
+transaction.state.log.replication.factor=1
+advertised.listeners=PLAINTEXT://localhost:9092--- ./.dockerignore ---
+kafka/kafka_2.13-*/
+kafka/data/
+kafka/kafka.pid
+kafka/kafka.log
+kafka/cluster.id
+kafka/server.properties[DIR]  ./ecom_pipeline
+--- ./ecom_pipeline/__main__.py ---
+import sys
+from pathlib import Path
 
-# ---- Download (skip if already there) ----
-if [ ! -d "$INSTALL_DIR" ]; then
-    if [ ! -f "$TARBALL" ]; then
-        echo "Downloading $TARBALL ..."
-        curl -fL --retry 3 -O "$DOWNLOAD_URL"
-    fi
-    echo "Extracting ..."
-    tar -xzf "$TARBALL"
-    rm -f "$TARBALL"
-else
-    echo "Kafka already extracted at $INSTALL_DIR"
-fi
+from ecom_pipeline.batch_report import get_top_ten_products, save_report
+from ecom_pipeline.generate import generate_csv
 
-# ---- Make it available to the current script ----
-export KAFKA_HOME="$INSTALL_DIR"
-export PATH="$KAFKA_HOME/bin:$PATH"
 
-echo "KAFKA_HOME=$KAFKA_HOME"
-echo "Kafka version: $("$KAFKA_HOME/bin/kafka-topics.sh" --version 2>/dev/null || echo 'unknown')"
+def main():
+    generate_csv(Path("./data/generated"))
+    df = get_top_ten_products(
+        Path("./data/generated") / "products.csv",
+        Path("./data/generated") / "orders.csv",
+    )
+    save_report(df, Path("./data/processed"))
+    return 0
 
---- ./scripts/check-kafka.sh ---
-#!/bin/bash
 
-pgrep -af kafka--- ./scripts/check-postgres.sh ---
-#!/bin/bash
+if __name__ == "__main__":
+    sys.exit(main())
+--- ./ecom_pipeline/__init__.py ---
+--- ./ecom_pipeline/stream_report.py ---
+--- ./ecom_pipeline/dashboard.py ---
+import sys
 
-PGPASSWORD=1234 psql -U kafka_user -h localhost -d ecommerce -c "
-SELECT 'orders' AS t, count(*) FROM orders
-UNION ALL SELECT 'orders_enriched', count(*) FROM orders_enriched
-UNION ALL SELECT 'products', count(*) FROM products
-UNION ALL SELECT 'inventory', count(*) FROM inventory
-UNION ALL SELECT 'top_ten_products', count(*) FROM top_ten_products
-UNION ALL SELECT 'alerts', count(*) FROM alerts;"--- ./scripts/stop-kafka.sh ---
-#!/bin/bash
-set -euo pipefail
-source "$(dirname "${BASH_SOURCE[0]}")/kafka-common.sh"
-setup_paths
+import pandas as pd
 
-PID_FILE="$KAFKA_DIR/kafka.pid"
+from ecom_pipeline.postgres import get_data_from_postgres
 
-if [ ! -f "$PID_FILE" ]; then
-    echo "No PID file at $PID_FILE. Nothing to stop."
-    exit 0
-fi
 
-PID="$(cat "$PID_FILE")"
+def _in_streamlit() -> bool:
+    try:
+        from streamlit.runtime import exists
 
-if ! kill -0 "$PID" 2>/dev/null; then
-    echo "Process $PID not running. Cleaning up PID file."
-    rm -f "$PID_FILE"
-    exit 0
-fi
+        return exists()
+    except ImportError:
+        return False
 
-echo "Stopping Kafka (PID $PID)..."
-kill -TERM "$PID"
 
-# Wait up to 30s for graceful shutdown
-for i in $(seq 1 30); do
-    if ! kill -0 "$PID" 2>/dev/null; then
-        rm -f "$PID_FILE"
-        echo "Kafka stopped."
-        exit 0
-    fi
-    sleep 1
-done
+def main():
+    """Entry point: `uv run dashboard [args...]`"""
+    from streamlit.web import cli as stcli
 
-echo "Kafka did not stop in 30s. Sending SIGKILL."
-kill -KILL "$PID" 2>/dev/null || true
-rm -f "$PID_FILE"
-echo "Kafka killed."--- ./scripts/reset-kafka.sh ---
-rm -rf ./kafka/data ./kafka/cluster.id ./kafka/kafka.log--- ./scripts/run-kafka-docker.sh ---
-#!/bin/bash
-set -euo pipefail
-source "$(dirname "${BASH_SOURCE[0]}")/kafka-common.sh"
-setup_paths
+    sys.argv = ["streamlit", "run", __file__, *sys.argv[1:]]
+    raise SystemExit(stcli.main())
 
-render_config
 
-CLUSTER_ID="$(cat "$KAFKA_DIR/cluster.id" 2>/dev/null || kafka-storage.sh random-uuid)"
-echo "$CLUSTER_ID" > "$KAFKA_DIR/cluster.id"
-kafka-storage.sh format -t "$CLUSTER_ID" -c "$KAFKA_CONFIG" --ignore-formatted
+def build_top_ten_products_section(st):
+    st.header("Top Ten Products by Revenue of Yesterday")
+    rows = get_data_from_postgres("top_ten_products")
+    df = pd.DataFrame(rows)
+    st.dataframe(
+        df,
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "product": st.column_config.TextColumn("Product"),
+            "revenue": st.column_config.NumberColumn(
+                "Revenue",
+                format="$%.2f",  # 11314.24 -> $11314.24
+            ),
+        },
+    )
 
-exec kafka-server-start.sh "$KAFKA_CONFIG"[DIR]  ./ecom_pipeline
+
+def build_low_stock_section(st):
+    st.header("Low Stock")
+    rows = get_data_from_postgres("low_stock_products")
+    df = pd.DataFrame(rows)
+    st.dataframe(df, width="stretch", hide_index=True)
+
+
+def build_alerts_section(st):
+    st.header("Alerts")
+    rows = get_data_from_postgres("alerts")
+    df = pd.DataFrame(rows)
+    st.dataframe(df, width="stretch", hide_index=True)
+
+
+# --- Streamlit UI runs here ---
+if _in_streamlit():
+    import streamlit as st
+    from streamlit_autorefresh import st_autorefresh
+
+    st_autorefresh(interval=2000, key="data_refresh")
+
+    st.title("Ecommerce Dashboard")
+    build_top_ten_products_section(st)
+    build_low_stock_section(st)
+    build_alerts_section(st)
+--- ./ecom_pipeline/generate.py ---
+from pathlib import Path
+
+import pandas as pd
+from faker import Faker
+from faker_ecommerce import EcommerceProvider
+
+NO_OF_PRODUCTS = 100
+NO_OF_ORDERS = 5000
+fake = Faker()
+fake.add_provider(EcommerceProvider)
+Faker.seed(0)
+
+
+def generate_products() -> pd.DataFrame:
+    products_df = pd.DataFrame(columns=["id", "name", "price"])
+    for i in range(NO_OF_PRODUCTS):
+        new_row = pd.DataFrame(
+            [{"id": fake.sku(), "name": fake.product_name(), "price": fake.price()}]
+        )
+        products_df = pd.concat([products_df, new_row])
+    return products_df
+
+
+def generate_inventory(products_df: pd.DataFrame) -> pd.DataFrame:
+    products = products_df["id"].to_list()
+    inventory_df = pd.DataFrame(columns=["product_id", "stock"])
+    for product in products:
+        new_row = pd.DataFrame(
+            [{"product_id": product, "stock": fake.random_int(min=1, max=99)}]
+        )
+        inventory_df = pd.concat([inventory_df, new_row])
+    return inventory_df
+
+
+def generate_orders(products_df: pd.DataFrame) -> pd.DataFrame:
+    products = products_df["id"].to_list()
+    orders_df = pd.DataFrame(
+        columns=["order_id", "order_date", "product_id", "quantity"]
+    )
+    for i in range(NO_OF_ORDERS):
+        new_row = pd.DataFrame(
+            [
+                {
+                    "order_id": fake.order_id(),
+                    "order_date": fake.date_between(start_date="-1y", end_date="today"),
+                    "product_id": fake.random_choices(elements=products, length=1)[0],
+                    "quantity": fake.random_int(min=1, max=9),
+                }
+            ]
+        )
+        orders_df = pd.concat([orders_df, new_row])
+    return orders_df
+
+
+def generate_csv(path: Path):
+    products_df = generate_products()
+    inventory_df = generate_inventory(products_df)
+    orders_df = generate_orders(products_df)
+
+    products_df.to_csv(path / "products.csv", index=False)
+    inventory_df.to_csv(path / "inventory.csv", index=False)
+    orders_df.to_csv(path / "orders.csv", index=False)
+
+    return 0
+--- ./ecom_pipeline/producer.py ---
+import os
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
+from time import sleep
+
+import pandas as pd
+from dotenv import load_dotenv
+from kafka.admin import KafkaAdminClient
+from kafka.errors import TopicAlreadyExistsError
+from tenacity import retry, stop_after_attempt, wait_exponential
+from kafka.errors import KafkaTimeoutError
+from kafka import DefaultSerializer, JsonSerializer, KafkaProducer
+
+load_dotenv()
+KAFKA_BOOTSTRAP = os.getenv("KAFKA_BOOTSTRAP")
+if KAFKA_BOOTSTRAP is None:
+    raise RuntimeError("KAFKA_BOOTSTRAP environment var is missing!")
+
+
+@retry(
+    stop=stop_after_attempt(10),
+    wait=wait_exponential(multiplier=1, min=1, max=10),
+    retry=lambda exc: isinstance(exc, KafkaTimeoutError),
+)
+def ensure_topics(topics: dict):
+    admin = KafkaAdminClient(bootstrap_servers=KAFKA_BOOTSTRAP)
+    for name, config in topics.items():
+        try:
+            admin.create_topics(
+                {
+                    name: {
+                        "num_partitions": 1,
+                        "replication_factor": 1,
+                        "configs": config,
+                    }
+                }
+            )
+        except TopicAlreadyExistsError:
+            pass
+    admin.close()
+
+
+def produce_records_stream(path: Path, topic: str, key_field: str):
+    producer = KafkaProducer(
+        bootstrap_servers=[KAFKA_BOOTSTRAP],
+        key_serializer=DefaultSerializer(),
+        value_serializer=JsonSerializer(),
+        enable_idempotence=True,
+        acks="all",
+    )
+    df = pd.read_csv(path)
+    for i, row in enumerate(df.to_dict(orient="records")):
+        if row.get("price") != None:
+            row["price"] = float(row["price"].lstrip("$"))
+        producer.send(topic, key=row[key_field], value=row)
+        if (i + 1) % 5 == 0:
+            producer.flush()
+            print("Flushing producer")
+            sleep(0.05)
+    producer.close()
+
+
+def stream_orders_cli():
+    produce_records_stream(Path("./data/generated/orders.csv"), "orders", "order_id")
+
+
+def stream_products_cli():
+    produce_records_stream(Path("./data/generated/products.csv"), "products", "id")
+
+
+def stream_inventory_cli():
+    produce_records_stream(
+        Path("./data/generated/inventory.csv"), "inventory", "product_id"
+    )
+
+
+def run_all_producers():
+    tasks = {
+        "orders": stream_orders_cli,
+        "products": stream_products_cli,
+        "inventory": stream_inventory_cli,
+    }
+    topics = {"orders": {}, "inventory": {}, "products": {"cleanup.policy": "compact"}}
+    ensure_topics(topics)
+    with ThreadPoolExecutor(max_workers=3) as thread_exe:
+        futures = {thread_exe.submit(func): name for name, func in tasks.items()}
+        for future in as_completed(futures):
+            name = futures[future]
+            try:
+                future.result()
+            except Exception as e:
+                print(f"{name} failed: {e}")
+--- ./ecom_pipeline/batch_report.py ---
+import sqlite3
+from pathlib import Path
+
+import pandas as pd
+
+
+def get_top_ten_products(product_csv_path: Path, orders_csv_path: Path):
+    products_df = pd.read_csv(product_csv_path)
+    orders_df = pd.read_csv(orders_csv_path)
+
+    orders_df["order_date"] = pd.to_datetime(orders_df["order_date"])
+    one_day_ago = (pd.Timestamp.now() - pd.Timedelta(days=1)).normalize()
+    recent_orders_df = orders_df[orders_df["order_date"] == one_day_ago]
+
+    df = recent_orders_df.merge(
+        products_df, left_on="product_id", right_on="id", how="inner"
+    )
+
+    df["price"] = df["price"].apply(lambda x: float(x.lstrip("$")))
+    df["revenue"] = df["price"] * df["quantity"]
+
+    top_ten_df = (
+        df[["id", "name", "revenue"]]
+        .groupby(["id", "name"], as_index=False)
+        .sum()
+        .sort_values("revenue", ascending=False)
+        .head(10)
+    )
+
+    return top_ten_df
+
+
+def save_report(df: pd.DataFrame, path: Path):
+    print(df)
+    df.to_csv(path / "report.csv")
+    with sqlite3.connect(path / "report.db") as conn:
+        df.to_sql("report", conn, if_exists="replace", index=False)
+--- ./ecom_pipeline/postgres.py ---
+import os
+from pathlib import Path
+
+from dotenv import load_dotenv
+from psycopg import sql
+from psycopg.rows import dict_row
+from psycopg_pool import ConnectionPool
+from tenacity import retry, stop_after_attempt, wait_exponential
+
+load_dotenv()
+
+_required = ["CREATE_TABLE_SQL_PATH", "POSTGRES_DSN"]
+_missing = [k for k in _required if not os.getenv(k)]
+if _missing:
+    raise RuntimeError(f"Missing env var(s): {', '.join(_missing)}")
+
+POSTGRES_DSN = os.getenv("POSTGRES_DSN")
+CREATE_TABLE_SQL_PATH = os.getenv("CREATE_TABLE_SQL_PATH")
+
+
+pool = ConnectionPool(
+    POSTGRES_DSN, min_size=2, max_size=8, kwargs={"row_factory": dict_row}
+)
+
+
+
+
+def get_schema_sql():
+    path = Path(CREATE_TABLE_SQL_PATH)
+    if not path.exists():
+        raise RuntimeError(
+            "schema for creating the table the aggregator writes to not found!"
+        )
+    with open(path, "r") as f:
+        return f.read()
+
+@retry(stop=stop_after_attempt(10), wait=wait_exponential(min=1, max=5))
+def make_tables():
+    with pool.connection() as conn, conn.cursor() as cur:
+        cur.execute(get_schema_sql())
+        conn.commit()
+
+
+@retry(stop=stop_after_attempt(3))
+def write_data_to_postgres(row: dict, table: str):
+    cols = sql.SQL(", ").join(sql.Identifier(k) for k in row)
+    placeholders = sql.SQL(", ").join(sql.Placeholder() for _ in row)
+    query = sql.SQL("INSERT INTO {} ({}) VALUES ({}) ON CONFLICT DO NOTHING").format(
+        sql.Identifier(table), cols, placeholders
+    )
+    with pool.connection() as conn, conn.cursor() as cur:
+        # print(f"Writing '{query}' to postgres")
+        cur.execute(query, list(row.values()))
+        conn.commit()
+
+@retry(stop=stop_after_attempt(10), wait=wait_exponential(min=1, max=5))
+def get_data_from_postgres(table):
+    with pool.connection() as conn, conn.cursor() as cur:
+        return cur.execute(
+            sql.SQL("SELECT * FROM {}").format(sql.Identifier(table))
+        ).fetchall()
 --- ./ecom_pipeline/aggregator.py ---
 import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -502,349 +954,294 @@ def consume_all_streams():
                 future.result()
             except Exception as e:
                 print(f"{name} failed: {e}")
---- ./ecom_pipeline/stream_report.py ---
---- ./ecom_pipeline/__init__.py ---
---- ./ecom_pipeline/dashboard.py ---
-import sys
-
-import pandas as pd
-
-from ecom_pipeline.postgres import get_data_from_postgres
-
-
-def _in_streamlit() -> bool:
-    try:
-        from streamlit.runtime import exists
-
-        return exists()
-    except ImportError:
-        return False
-
-
-def main():
-    """Entry point: `uv run dashboard [args...]`"""
-    from streamlit.web import cli as stcli
-
-    sys.argv = ["streamlit", "run", __file__, *sys.argv[1:]]
-    raise SystemExit(stcli.main())
-
-
-def build_top_ten_products_section(st):
-    st.header("Top Ten Products by Revenue of Yesterday")
-    rows = get_data_from_postgres("top_ten_products")
-    df = pd.DataFrame(rows)
-    st.dataframe(
-        df,
-        use_container_width=True,
-        hide_index=True,
-        column_config={
-            "product": st.column_config.TextColumn("Product"),
-            "revenue": st.column_config.NumberColumn(
-                "Revenue",
-                format="$%.2f",  # 11314.24 -> $11314.24
-            ),
-        },
-    )
-
-
-def build_low_stock_section(st):
-    st.header("Low Stock")
-    rows = get_data_from_postgres("low_stock_products")
-    df = pd.DataFrame(rows)
-    st.dataframe(df, width="stretch", hide_index=True)
-
-
-def build_alerts_section(st):
-    st.header("Alerts")
-    rows = get_data_from_postgres("alerts")
-    df = pd.DataFrame(rows)
-    st.dataframe(df, width="stretch", hide_index=True)
-
-
-# --- Streamlit UI runs here ---
-if _in_streamlit():
-    import streamlit as st
-    from streamlit_autorefresh import st_autorefresh
-
-    st_autorefresh(interval=2000, key="data_refresh")
-
-    st.title("Ecommerce Dashboard")
-    build_top_ten_products_section(st)
-    build_low_stock_section(st)
-    build_alerts_section(st)
---- ./ecom_pipeline/batch_report.py ---
-import sqlite3
-from pathlib import Path
-
-import pandas as pd
-
-
-def get_top_ten_products(product_csv_path: Path, orders_csv_path: Path):
-    products_df = pd.read_csv(product_csv_path)
-    orders_df = pd.read_csv(orders_csv_path)
-
-    orders_df["order_date"] = pd.to_datetime(orders_df["order_date"])
-    one_day_ago = (pd.Timestamp.now() - pd.Timedelta(days=1)).normalize()
-    recent_orders_df = orders_df[orders_df["order_date"] == one_day_ago]
-
-    df = recent_orders_df.merge(
-        products_df, left_on="product_id", right_on="id", how="inner"
-    )
-
-    df["price"] = df["price"].apply(lambda x: float(x.lstrip("$")))
-    df["revenue"] = df["price"] * df["quantity"]
-
-    top_ten_df = (
-        df[["id", "name", "revenue"]]
-        .groupby(["id", "name"], as_index=False)
-        .sum()
-        .sort_values("revenue", ascending=False)
-        .head(10)
-    )
-
-    return top_ten_df
-
-
-def save_report(df: pd.DataFrame, path: Path):
-    print(df)
-    df.to_csv(path / "report.csv")
-    with sqlite3.connect(path / "report.db") as conn:
-        df.to_sql("report", conn, if_exists="replace", index=False)
---- ./ecom_pipeline/producer.py ---
-import os
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from pathlib import Path
-from time import sleep
-
-import pandas as pd
-from dotenv import load_dotenv
-from kafka.admin import KafkaAdminClient
-from kafka.errors import TopicAlreadyExistsError
-
-from kafka import DefaultSerializer, JsonSerializer, KafkaProducer
-
-load_dotenv()
-KAFKA_BOOTSTRAP = os.getenv("KAFKA_BOOTSTRAP")
-if KAFKA_BOOTSTRAP is None:
-    raise RuntimeError("KAFKA_BOOTSTRAP environment var is missing!")
-
-
-def ensure_topics(topics: dict):
-    admin = KafkaAdminClient(bootstrap_servers=KAFKA_BOOTSTRAP)
-    for name, config in topics.items():
-        try:
-            admin.create_topics(
-                {
-                    name: {
-                        "num_partitions": 1,
-                        "replication_factor": 1,
-                        "configs": config,
-                    }
-                }
-            )
-        except TopicAlreadyExistsError:
-            pass
-    admin.close()
-
-
-def produce_records_stream(path: Path, topic: str, key_field: str):
-    producer = KafkaProducer(
-        bootstrap_servers=[KAFKA_BOOTSTRAP],
-        key_serializer=DefaultSerializer(),
-        value_serializer=JsonSerializer(),
-        enable_idempotence=True,
-        acks="all",
-    )
-    df = pd.read_csv(path)
-    for i, row in enumerate(df.to_dict(orient="records")):
-        if row.get("price") != None:
-            row["price"] = float(row["price"].lstrip("$"))
-        producer.send(topic, key=row[key_field], value=row)
-        if (i + 1) % 5 == 0:
-            producer.flush()
-            print("Flushing producer")
-            sleep(0.05)
-    producer.close()
-
-
-def stream_orders_cli():
-    produce_records_stream(Path("./data/generated/orders.csv"), "orders", "order_id")
-
-
-def stream_products_cli():
-    produce_records_stream(Path("./data/generated/products.csv"), "products", "id")
-
-
-def stream_inventory_cli():
-    produce_records_stream(
-        Path("./data/generated/inventory.csv"), "inventory", "product_id"
-    )
-
-
-def run_all_producers():
-    tasks = {
-        "orders": stream_orders_cli,
-        "products": stream_products_cli,
-        "inventory": stream_inventory_cli,
-    }
-    topics = {"orders": {}, "inventory": {}, "products": {"cleanup.policy": "compact"}}
-    ensure_topics(topics)
-    with ThreadPoolExecutor(max_workers=3) as thread_exe:
-        futures = {thread_exe.submit(func): name for name, func in tasks.items()}
-        for future in as_completed(futures):
-            name = futures[future]
-            try:
-                future.result()
-            except Exception as e:
-                print(f"{name} failed: {e}")
---- ./ecom_pipeline/postgres.py ---
-import os
-from pathlib import Path
-
-from dotenv import load_dotenv
-from psycopg import sql
-from psycopg.rows import dict_row
-from psycopg_pool import ConnectionPool
-from tenacity import retry, stop_after_attempt
-
-load_dotenv()
-
-_required = ["CREATE_TABLE_SQL_PATH", "POSTGRES_DSN"]
-_missing = [k for k in _required if not os.getenv(k)]
-if _missing:
-    raise RuntimeError(f"Missing env var(s): {', '.join(_missing)}")
-
-POSTGRES_DSN = os.getenv("POSTGRES_DSN")
-CREATE_TABLE_SQL_PATH = os.getenv("CREATE_TABLE_SQL_PATH")
-
-
-pool = ConnectionPool(
-    POSTGRES_DSN, min_size=2, max_size=8, kwargs={"row_factory": dict_row}
-)
-
-
-
-
-def get_schema_sql():
-    path = Path(CREATE_TABLE_SQL_PATH)
-    if not path.exists():
-        raise RuntimeError(
-            "schema for creating the table the aggregator writes to not found!"
-        )
-    with open(path, "r") as f:
-        return f.read()
-
-
-def make_tables():
-    with pool.connection() as conn, conn.cursor() as cur:
-        cur.execute(get_schema_sql())
-        conn.commit()
-
-
-@retry(stop=stop_after_attempt(3))
-def write_data_to_postgres(row: dict, table: str):
-    cols = sql.SQL(", ").join(sql.Identifier(k) for k in row)
-    placeholders = sql.SQL(", ").join(sql.Placeholder() for _ in row)
-    query = sql.SQL("INSERT INTO {} ({}) VALUES ({}) ON CONFLICT DO NOTHING").format(
-        sql.Identifier(table), cols, placeholders
-    )
-    with pool.connection() as conn, conn.cursor() as cur:
-        # print(f"Writing '{query}' to postgres")
-        cur.execute(query, list(row.values()))
-        conn.commit()
-
-
-def get_data_from_postgres(table):
-    with pool.connection() as conn, conn.cursor() as cur:
-        return cur.execute(
-            sql.SQL("SELECT * FROM {}").format(sql.Identifier(table))
-        ).fetchall()
---- ./ecom_pipeline/generate.py ---
-from pathlib import Path
-
-import pandas as pd
-from faker import Faker
-from faker_ecommerce import EcommerceProvider
-
-NO_OF_PRODUCTS = 100
-NO_OF_ORDERS = 5000
-fake = Faker()
-fake.add_provider(EcommerceProvider)
-Faker.seed(0)
-
-
-def generate_products() -> pd.DataFrame:
-    products_df = pd.DataFrame(columns=["id", "name", "price"])
-    for i in range(NO_OF_PRODUCTS):
-        new_row = pd.DataFrame(
-            [{"id": fake.sku(), "name": fake.product_name(), "price": fake.price()}]
-        )
-        products_df = pd.concat([products_df, new_row])
-    return products_df
-
-
-def generate_inventory(products_df: pd.DataFrame) -> pd.DataFrame:
-    products = products_df["id"].to_list()
-    inventory_df = pd.DataFrame(columns=["product_id", "stock"])
-    for product in products:
-        new_row = pd.DataFrame(
-            [{"product_id": product, "stock": fake.random_int(min=1, max=99)}]
-        )
-        inventory_df = pd.concat([inventory_df, new_row])
-    return inventory_df
-
-
-def generate_orders(products_df: pd.DataFrame) -> pd.DataFrame:
-    products = products_df["id"].to_list()
-    orders_df = pd.DataFrame(
-        columns=["order_id", "order_date", "product_id", "quantity"]
-    )
-    for i in range(NO_OF_ORDERS):
-        new_row = pd.DataFrame(
-            [
-                {
-                    "order_id": fake.order_id(),
-                    "order_date": fake.date_between(start_date="-1y", end_date="today"),
-                    "product_id": fake.random_choices(elements=products, length=1)[0],
-                    "quantity": fake.random_int(min=1, max=9),
-                }
-            ]
-        )
-        orders_df = pd.concat([orders_df, new_row])
-    return orders_df
-
-
-def generate_csv(path: Path):
-    products_df = generate_products()
-    inventory_df = generate_inventory(products_df)
-    orders_df = generate_orders(products_df)
-
-    products_df.to_csv(path / "products.csv", index=False)
-    inventory_df.to_csv(path / "inventory.csv", index=False)
-    orders_df.to_csv(path / "orders.csv", index=False)
-
-    return 0
---- ./ecom_pipeline/__main__.py ---
-import sys
-from pathlib import Path
-
-from ecom_pipeline.batch_report import get_top_ten_products, save_report
-from ecom_pipeline.generate import generate_csv
-
-
-def main():
-    generate_csv(Path("./data/generated"))
-    df = get_top_ten_products(
-        Path("./data/generated") / "products.csv",
-        Path("./data/generated") / "orders.csv",
-    )
-    save_report(df, Path("./data/processed"))
-    return 0
-
-
-if __name__ == "__main__":
-    sys.exit(main())
---- ./dashboard-screenshot.png ---
+--- ./LICENSE ---
+MIT License
+
+Copyright (c) 2026 samuel-jinadu
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.[DIR]  ./scripts
+--- ./scripts/check-postgres.sh ---
+#!/bin/bash
+
+PGPASSWORD=1234 psql -U kafka_user -h localhost -d ecommerce -c "
+SELECT 'orders' AS t, count(*) FROM orders
+UNION ALL SELECT 'orders_enriched', count(*) FROM orders_enriched
+UNION ALL SELECT 'products', count(*) FROM products
+UNION ALL SELECT 'inventory', count(*) FROM inventory
+UNION ALL SELECT 'top_ten_products', count(*) FROM top_ten_products
+UNION ALL SELECT 'alerts', count(*) FROM alerts;"--- ./scripts/run-kafka.sh ---
+#!/bin/bash
+set -euo pipefail
+source "$(dirname "${BASH_SOURCE[0]}")/kafka-common.sh"
+setup_paths
+
+render_config
+
+
+CLUSTER_ID="$(cat "$KAFKA_DIR/cluster.id" 2>/dev/null || kafka-storage.sh random-uuid)"
+echo "$CLUSTER_ID" > "$KAFKA_DIR/cluster.id"
+kafka-storage.sh format -t "$CLUSTER_ID" -c "$KAFKA_CONFIG" --ignore-formatted
+
+PID_FILE="$KAFKA_DIR/kafka.pid"
+
+if [ -f "$PID_FILE" ] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
+    echo "Kafka already running (PID $(cat "$PID_FILE"))."
+    exit 0
+fi
+
+LOG_FILE="$KAFKA_DIR/kafka.log"
+echo "Starting Kafka..."
+# export KAFKA_LOG4J_OPTS="-Dlog4j2.configurationFile=file:/path/to/your/custom-log4j2.yaml" # this line is in case i change my mind about a custom log options file
+kafka-server-start.sh "$KAFKA_CONFIG" > "$LOG_FILE" 2>&1 &
+
+PID=$!
+echo "$PID" > "$PID_FILE"
+
+# Wait a moment and verify it's actually alive
+sleep 2
+if ! kill -0 "$PID" 2>/dev/null; then
+    echo "ERROR: Kafka died during startup. Last 20 lines of $LOG_FILE:" >&2
+    tail -n 20 "$LOG_FILE" >&2
+    rm -f "$PID_FILE"
+    exit 1
+fi
+
+echo "Kafka started (PID $PID). Logs: $LOG_FILE"
+
+# kafka-topics.sh --create \
+#   --topic orders \
+#   --partitions 1 \
+#   --replication-factor 1 \
+#   --bootstrap-server localhost:9092 \
+#   --if-not-exists
+
+tail -f "$LOG_FILE"--- ./scripts/stop-kafka.sh ---
+#!/bin/bash
+set -euo pipefail
+source "$(dirname "${BASH_SOURCE[0]}")/kafka-common.sh"
+setup_paths
+
+PID_FILE="$KAFKA_DIR/kafka.pid"
+
+if [ ! -f "$PID_FILE" ]; then
+    echo "No PID file at $PID_FILE. Nothing to stop."
+    exit 0
+fi
+
+PID="$(cat "$PID_FILE")"
+
+if ! kill -0 "$PID" 2>/dev/null; then
+    echo "Process $PID not running. Cleaning up PID file."
+    rm -f "$PID_FILE"
+    exit 0
+fi
+
+echo "Stopping Kafka (PID $PID)..."
+kill -TERM "$PID"
+
+# Wait up to 30s for graceful shutdown
+for i in $(seq 1 30); do
+    if ! kill -0 "$PID" 2>/dev/null; then
+        rm -f "$PID_FILE"
+        echo "Kafka stopped."
+        exit 0
+    fi
+    sleep 1
+done
+
+echo "Kafka did not stop in 30s. Sending SIGKILL."
+kill -KILL "$PID" 2>/dev/null || true
+rm -f "$PID_FILE"
+echo "Kafka killed."--- ./scripts/reset-kafka.sh ---
+rm -rf ./kafka/data ./kafka/cluster.id ./kafka/kafka.log--- ./scripts/run-kafka-docker.sh ---
+#!/bin/bash
+set -euo pipefail
+source "$(dirname "${BASH_SOURCE[0]}")/kafka-common.sh"
+setup_paths
+
+render_config
+
+CLUSTER_ID="$(cat "$KAFKA_DIR/cluster.id" 2>/dev/null || kafka-storage.sh random-uuid)"
+echo "$CLUSTER_ID" > "$KAFKA_DIR/cluster.id"
+kafka-storage.sh format -t "$CLUSTER_ID" -c "$KAFKA_CONFIG" --ignore-formatted
+
+exec kafka-server-start.sh "$KAFKA_CONFIG"--- ./scripts/check-kafka.sh ---
+#!/bin/bash
+
+pgrep -af kafka--- ./scripts/kafka-common.sh ---
+#!/bin/bash
+# Shared helpers for Kafka scripts. Source this, don't execute it.
+
+find_project_root() {
+    local dir="$1"
+    while [ "$dir" != "/" ]; do
+        if [ -f "$dir/pyproject.toml" ]; then
+            echo "$dir"
+            return 0
+        fi
+        dir="$(dirname "$dir")"
+    done
+    echo "ERROR: could not find project root (no pyproject.toml)" >&2
+    return 1
+}
+
+# Sets: PROJECT_ROOT, SCRIPT_DIR, KAFKA_DIR, KAFKA_CONFIG, KAFKA_DATA_DIR
+setup_paths() {
+    SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    PROJECT_ROOT="$(find_project_root "$SCRIPT_DIR")"
+    KAFKA_DIR="$PROJECT_ROOT/kafka"
+    KAFKA_CONFIG="$KAFKA_DIR/server.properties"
+    KAFKA_TEMPLATE="$KAFKA_DIR/server.properties.template"
+    KAFKA_DATA_DIR="$KAFKA_DIR/data"
+    export PROJECT_ROOT SCRIPT_DIR KAFKA_DIR KAFKA_CONFIG KAFKA_TEMPLATE KAFKA_DATA_DIR
+
+}
+
+render_config() {
+    mkdir -p "$KAFKA_DATA_DIR"
+    sed "s|__KAFKA_DATA_DIR__|$KAFKA_DATA_DIR|g" \
+        "$KAFKA_TEMPLATE" > "$KAFKA_CONFIG"
+}--- ./scripts/install-kafka.sh ---
+#!/bin/bash
+set -euo pipefail
+source "$(dirname "${BASH_SOURCE[0]}")/kafka-common.sh"
+setup_paths
+
+: "${KAFKA_VERSION:=4.3.1}"
+: "${SCALA_VERSION:=2.13}"
+: "${ARCHIVE_NAME:=kafka_${SCALA_VERSION}-${KAFKA_VERSION}}"
+TARBALL="${ARCHIVE_NAME}.tgz"
+DOWNLOAD_URL="https://archive.apache.org/kafka/${KAFKA_VERSION}/${TARBALL}"
+INSTALL_DIR="$KAFKA_DIR/${ARCHIVE_NAME}"
+
+mkdir -p "$KAFKA_DIR"
+cd "$KAFKA_DIR"
+
+# ---- Download (skip if already there) ----
+if [ ! -d "$INSTALL_DIR" ]; then
+    if [ ! -f "$TARBALL" ]; then
+        echo "Downloading $TARBALL ..."
+        curl -fL --retry 3 -O "$DOWNLOAD_URL"
+    fi
+    echo "Extracting ..."
+    tar -xzf "$TARBALL"
+    rm -f "$TARBALL"
+else
+    echo "Kafka already extracted at $INSTALL_DIR"
+fi
+
+# ---- Make it available to the current script ----
+export KAFKA_HOME="$INSTALL_DIR"
+export PATH="$KAFKA_HOME/bin:$PATH"
+
+echo "KAFKA_HOME=$KAFKA_HOME"
+echo "Kafka version: $("$KAFKA_HOME/bin/kafka-topics.sh" --version 2>/dev/null || echo 'unknown')"
+
+--- ./compose.yaml ---
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_DB: ecommerce
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d ecommerce"]
+      interval: 5s
+      retries: 5
+    ports: ["5432:5432"]
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./data/schema.sql:/docker-entrypoint-initdb.d/schema.sql
+
+  kafka:
+    image: apache/kafka
+    ports:
+      - "29092:29092"
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093,PLAINTEXT_HOST://:29092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:29092
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list"]
+      interval: 5s
+      retries: 12
+      start_period: 20s
+
+  app-producer:
+    build:
+      context: .
+      dockerfile: Dockerfile.app
+    depends_on:
+      kafka:
+        condition: service_healthy
+    environment:
+      KAFKA_BOOTSTRAP: kafka:9092
+      POSTGRES_DSN: postgresql://postgres:postgres@postgres:5432/ecommerce
+      CREATE_TABLE_SQL_PATH: ./data/schema.sql
+    # Generate CSVs first, then stream them
+    command: ["sh", "-c", "uv run --no-sync ecom-pipeline && uv run --no-sync producer"]
+
+  app-aggregator:
+    build:
+      context: .
+      dockerfile: Dockerfile.app
+    depends_on:
+      kafka:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    environment:
+      KAFKA_BOOTSTRAP: kafka:9092
+      POSTGRES_DSN: postgresql://postgres:postgres@postgres:5432/ecommerce
+      CREATE_TABLE_SQL_PATH: ./data/schema.sql
+    command: ["uv", "run", "--no-sync", "aggregator"]
+
+  dashboard:
+    build:
+      context: .
+      dockerfile: Dockerfile.app
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      POSTGRES_DSN: postgresql://postgres:postgres@postgres:5432/ecommerce
+      CREATE_TABLE_SQL_PATH: ./data/schema.sql
+      # Important for Docker: bind to all interfaces and disable headless browser
+      STREAMLIT_SERVER_ADDRESS: 0.0.0.0
+      STREAMLIT_SERVER_PORT: 8501
+      STREAMLIT_SERVER_HEADLESS: "true"
+    ports:
+      - "8501:8501"
+    command: ["uv", "run", "--no-sync", "dashboard"]
+
+volumes:
+  pgdata:--- ./dashboard-screenshot.png ---
 �PNG
 
    IHDR  Z  f   ��;�   sRGB ���   gAMA  ���a   	pHYs  �  ��o�d  ��IDATx^��@Vu�����l`rV+h,p)�ʂ�F�Fb�l0k �7m-�k:�����:�h~MW�f��N62�c&��,���Mw�� �
@@ -1125,91 +1522,4 @@ s�g��LM�5h���u�;��N�<��)Z�oj��u���z�%i�w���	�Kv��_x(��h��h�fi�Q*ӻ���O��
        "�
        "�
        "�
-       �e�رߙ+�NcU        ������k���7�h=�v��ȈV       DOB����H�      ��'VJ���:        �S       �UB�       D�       "���/��Y�[    IEND�B`�--- ./LICENSE ---
-MIT License
-
-Copyright (c) 2026 samuel-jinadu
-
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.[DIR]  ./kafka
---- ./kafka/server.properties.template ---
-process.roles=broker,controller
-node.id=1
-controller.quorum.voters=1@localhost:9093
-log.dirs=__KAFKA_DATA_DIR__
-listeners=PLAINTEXT://:9092,CONTROLLER://:9093
-controller.listener.names=CONTROLLER
-listener.security.protocol.map=CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
-offsets.topic.replication.factor=1
-transaction.state.log.replication.factor=1
-advertised.listeners=PLAINTEXT://localhost:9092--- ./kafka/server.properties ---
-process.roles=broker,controller
-node.id=1
-controller.quorum.voters=1@localhost:9093
-log.dirs=/home/samuel/practice/kafka/ecom-pipeline/kafka/data
-listeners=PLAINTEXT://:9092,CONTROLLER://:9093
-controller.listener.names=CONTROLLER
-listener.security.protocol.map=CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
-offsets.topic.replication.factor=1
-transaction.state.log.replication.factor=1
-advertised.listeners=PLAINTEXT://localhost:9092--- ./kafka/cluster.id ---
-bmIbZmjMT5aX1w0SqTR5SQ
---- ./Dockerfile.deprecated ---
-# Start from the minimal official Python slim image
-FROM python:3.11-slim
-
-
-# Install Java (OpenJDK) headless and clean up package caches in one layer
-RUN apt-get update && apt-get install -y \
-    openjdk-17-jre-headless \
-    curl \
-    procps \
-    && rm -rf /var/lib/apt/lists/*
-
-# get uv
-COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
-
-# Set up your working directory
-WORKDIR /app
-
-
-# Copy dependency configuration files first to leverage Docker layer caching
-COPY pyproject.toml uv.lock ./
-COPY ecom_pipeline ./ecom_pipeline
-
-# Run uv sync to install dependencies without the project source code yet
-RUN uv sync --frozen --no-install-project --no-dev
-
-# Copy the project
-COPY scripts ./scripts
-COPY kafka ./kafka
-COPY data ./data
-
-
-ENV KAFKA_VERSION=4.3.1
-ENV KAFKA_HOME=/app/kafka/kafka_2.13-4.3.1
-ENV PATH=${KAFKA_HOME}/bin:${PATH}
-
-
-# install kafka
-RUN chmod +x scripts/*.sh
-RUN bash scripts/install-kafka.sh
-
-
-
-CMD ["bash", "scripts/run-kafka-docker.sh"]
+       �e�رߙ+�NcU        ������k���7�h=�v��ȈV       DOB����H�      ��'VJ���:        �S       �UB�       D�       "���/��Y�[    IEND�B`�
