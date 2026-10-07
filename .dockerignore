@@ -1,0 +1,6 @@
+kafka/kafka_2.13-*/
+kafka/data/
+kafka/kafka.pid
+kafka/kafka.log
+kafka/cluster.id
+kafka/server.properties

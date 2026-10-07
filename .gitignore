@@ -1,0 +1,9 @@
+kafka/server.properties
+kafka/cluster.id
+kafka/data/
+kafka/kafka.pid
+kafka/kafka.log
+__pycache__/
+.venv/
+.ruff_cache
+.vscode

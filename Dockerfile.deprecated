@@ -1,0 +1,43 @@
+# Start from the minimal official Python slim image
+FROM python:3.11-slim
+
+
+# Install Java (OpenJDK) headless and clean up package caches in one layer
+RUN apt-get update && apt-get install -y \
+    openjdk-17-jre-headless \
+    curl \
+    procps \
+    && rm -rf /var/lib/apt/lists/*
+
+# get uv
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
+
+# Set up your working directory
+WORKDIR /app
+
+
+# Copy dependency configuration files first to leverage Docker layer caching
+COPY pyproject.toml uv.lock ./
+COPY ecom_pipeline ./ecom_pipeline
+
+# Run uv sync to install dependencies without the project source code yet
+RUN uv sync --frozen --no-install-project --no-dev
+
+# Copy the project
+COPY scripts ./scripts
+COPY kafka ./kafka
+COPY data ./data
+
+
+ENV KAFKA_VERSION=4.3.1
+ENV KAFKA_HOME=/app/kafka/kafka_2.13-4.3.1
+ENV PATH=${KAFKA_HOME}/bin:${PATH}
+
+
+# install kafka
+RUN chmod +x scripts/*.sh
+RUN bash scripts/install-kafka.sh
+
+
+
+CMD ["bash", "scripts/run-kafka-docker.sh"]

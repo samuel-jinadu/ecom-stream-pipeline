@@ -1,0 +1,1 @@
+rm -rf ./kafka/data ./kafka/cluster.id ./kafka/kafka.log
